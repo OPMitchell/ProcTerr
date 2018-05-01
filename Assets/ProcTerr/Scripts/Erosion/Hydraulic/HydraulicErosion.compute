@@ -1,0 +1,287 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSTransport
+#pragma kernel CSWater
+#pragma kernel CSEvaporation
+
+RWStructuredBuffer<float> heightMap;
+RWStructuredBuffer<float> oldWaterMap;
+RWStructuredBuffer<float> waterMap;
+RWStructuredBuffer<float> sedimentMap;
+
+RWStructuredBuffer<float> temperatureMap;
+RWStructuredBuffer<float> precipitationMap;
+
+RWStructuredBuffer<float> originalHeightMap;
+RWStructuredBuffer<float> layerHeights;
+RWStructuredBuffer<float> layerSolubilities;
+
+float waterStepCoef;
+float solubilityConst;
+float sedimentCapacityCoef;
+float evaporationCoef;
+float temperatureWeightCoef;
+float rainWeightCoef;
+
+int numberOfLayers;
+
+int numberOfThreadGroups;
+int width;
+
+int gX;
+int gY;
+
+int currentPos = 0;
+
+int nLeft = 0;
+int nRight = 0;
+int nUp = 0;
+int nDown = 0;
+
+int nLeftUp = 0;
+int nLeftDown = 0;
+int nRightUp = 0;
+int nRightDown = 0;
+
+struct Data
+{
+	float averageHeight;
+	float sumDifference;
+	int noOfCells;
+};
+
+float GetAltitude(int pos)
+{
+	return heightMap[pos];
+}
+
+float GetWater(int pos)
+{
+	return waterMap[pos];
+}
+
+float GetSediment(int pos)
+{
+	return sedimentMap[pos];
+}
+
+void AddHeight(int pos, float amount)
+{
+	heightMap[pos] += amount;
+}
+
+void AddWater(int pos, float amount)
+{
+	waterMap[pos] += amount;
+}
+
+void AddSediment(int pos, float amount)
+{
+	sedimentMap[pos] += amount;
+}
+
+void FindPositions(uint3 id)
+{
+	int x = id.x;
+	int y = id.y * width;
+	gX = id.x;
+	gY = id.y;
+
+	currentPos = x+y;
+
+	nLeft = currentPos -1;
+	nRight = currentPos +1;
+	nUp = currentPos - width;
+	nDown = currentPos + width;
+	nLeftUp = (currentPos - width) -1;
+	nLeftDown = (currentPos + width) -1;
+	nRightUp = (currentPos - width) +1;
+	nRightDown = (currentPos + width) +1;
+}
+
+bool IsPosValid(int pos)
+{
+	if(((currentPos) % width == 0) && ((pos == nLeft)||(pos == nLeftUp)||(pos == nLeftDown)))
+		return false;
+	if(((currentPos+1) % width == 0) && ((pos == nRight)||(pos == nRightUp)||(pos == nRightDown)))
+		return false;
+	if(((currentPos >= (width*(width-1))) && (currentPos < (width*width))) && ((pos == nLeftDown)||(pos == nDown)||(pos == nRightDown)))
+		return false;
+	if((currentPos >= 0 && currentPos < width) && ((pos == nLeftUp)||(pos == nUp)||(pos == nRightUp)))
+		return false;
+	return true;
+}
+
+float Difference(int neighbourPos)
+{
+	if(!IsPosValid(neighbourPos))
+		return -1.0f;
+	return (heightMap[currentPos] + oldWaterMap[currentPos]) - (heightMap[neighbourPos] + oldWaterMap[neighbourPos]);
+};
+
+bool IsPositive(float val)
+{
+	if(val > 0)
+		return true;
+	return false;
+}
+
+Data GetDifference(Data d, int pos)
+{
+	float diff = Difference(pos);
+	if(IsPositive(diff))
+	{
+		d.averageHeight += heightMap[pos] + oldWaterMap[pos];
+		d.sumDifference += diff;
+		d.noOfCells++;
+	}
+	return d;
+}
+
+Data GetDifferences(Data d)
+{
+	d = GetDifference(d, nUp);
+	d = GetDifference(d, nDown);
+	d = GetDifference(d, nLeft);
+	d = GetDifference(d, nRight);
+	d = GetDifference(d, nLeftUp);
+	d = GetDifference(d, nLeftDown);
+	d = GetDifference(d, nRightUp);
+	d = GetDifference(d, nRightDown);
+	d.averageHeight /= d.noOfCells;
+	return d;
+}
+
+float CalcWaterAmount(Data d, int pos)
+{
+	return min(oldWaterMap[currentPos], ((heightMap[currentPos] + oldWaterMap[currentPos])-d.averageHeight)) * (Difference(pos)/d.sumDifference);
+}
+
+float MoveWater(Data d, int pos)
+{
+	float waterAmount = 0.0f;
+	float diff = Difference(pos);
+	if(IsPositive(diff))
+	{
+		waterAmount = CalcWaterAmount(d, pos);
+		AddWater(currentPos, -1*waterAmount);
+		//AddWater(pos, waterAmount);
+	}
+	return waterAmount;
+}
+
+float MoveSediment(int pos, float waterAmount)
+{
+	float sedimentAmount = 0.0f;
+	float diff = Difference(pos);
+	if(IsPositive(diff))
+	{
+		sedimentAmount = GetSediment(currentPos) * (waterAmount/(GetWater(currentPos)-waterAmount));
+		//AddSediment(pos, sedimentAmount);
+		AddSediment(currentPos, -1*sedimentAmount);
+	}
+	return sedimentAmount;
+}
+
+float CalcWaterMovement(int pos, Data d)
+{
+	return MoveWater(d, pos);
+}
+
+float CalcSedimentMovement(int pos, float waterAmount)
+{
+	return MoveSediment(pos, waterAmount);
+}
+
+void CalcWaterAndSedimentMovement(int pos, Data d)
+{
+	CalcSedimentMovement(pos, CalcWaterMovement(pos, d));
+}
+
+void MoveWaterAndSediment(Data d)
+{	
+	CalcWaterAndSedimentMovement(nLeftDown, d);
+	CalcWaterAndSedimentMovement(nUp, d);
+	CalcWaterAndSedimentMovement(nRightUp, d);
+	CalcWaterAndSedimentMovement(nRight, d);
+	CalcWaterAndSedimentMovement(nLeft, d);
+	CalcWaterAndSedimentMovement(nLeftUp, d);
+	CalcWaterAndSedimentMovement(nRightDown, d);
+	CalcWaterAndSedimentMovement(nDown, d);
+}
+
+void Transport()
+{
+	Data d;
+	d.sumDifference = 0.0f;
+	d.averageHeight = heightMap[currentPos] + oldWaterMap[currentPos];
+	d.noOfCells = 1;
+
+	d = GetDifferences(d);
+	MoveWaterAndSediment(d);
+}
+
+float Lerp(float n1, float n2, float time)
+{
+	return n1 + (n2 - n1) * time;
+}
+
+void WaterStep()
+{
+	float newWaterAmount = Lerp(waterStepCoef, waterStepCoef*precipitationMap[currentPos], rainWeightCoef);
+	waterMap[currentPos] += newWaterAmount;
+}
+
+void AbsorbStep()
+{
+	float absorptionAmount;
+	//layers must be in descending height order
+	for(int i = 0; i < numberOfLayers; i++)
+	{
+		float toplayerstart = (originalHeightMap[currentPos]*layerHeights[i]); //top layer start
+		float bottomlayerstart = 0.0f;
+		if(i < numberOfLayers -1) //if not the last layer
+		  bottomlayerstart = (originalHeightMap[currentPos]*layerHeights[i+1]);
+		if(heightMap[currentPos] <= toplayerstart && heightMap[currentPos] > bottomlayerstart)
+		{
+			absorptionAmount = (layerSolubilities[i]*solubilityConst)*waterMap[currentPos];
+			break;
+		}
+	}
+
+	heightMap[currentPos] -= absorptionAmount;
+	sedimentMap[currentPos] += absorptionAmount;
+}
+
+void EvaporationStep()
+{
+	float evaporation = Lerp(evaporationCoef, evaporationCoef*temperatureMap[currentPos], temperatureWeightCoef);
+	waterMap[currentPos] *= evaporation;
+
+	float maxSediment = sedimentCapacityCoef * waterMap[currentPos];
+	float excess = max(0.0f, sedimentMap[currentPos] - maxSediment);
+	AddSediment(currentPos, excess*-1);
+	AddHeight(currentPos, excess);
+}
+
+[numthreads(9,27,1)]
+void CSTransport (uint3 id : SV_DispatchThreadID)
+{
+	FindPositions(id);
+	Transport();
+}
+
+[numthreads(9,27,1)]
+void CSWater (uint3 id : SV_DispatchThreadID)
+{
+	FindPositions(id);
+	WaterStep();
+	AbsorbStep();
+}
+
+[numthreads(9,27,1)]
+void CSEvaporation (uint3 id : SV_DispatchThreadID)
+{
+	FindPositions(id);
+	EvaporationStep();
+}
+
